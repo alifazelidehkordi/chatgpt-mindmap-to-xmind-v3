@@ -1,0 +1,27 @@
+# Python
+.venv/
+.venv-linux/
+__pycache__/
+*.pyc
+
+# Runtime data (created on first run)
+chrome_profile/
+**/Cookies.bak.*
+edge_profile/
+downloads/*
+!downloads/.gitkeep
+outputs/opml/*
+!outputs/opml/.gitkeep
+outputs/xmind/*
+!outputs/xmind/.gitkeep
+run.log
+logs/*
+!logs/.gitkeep
+batch_stdout.txt
+batch_stderr.txt
+*.last_response.txt
+*.last_state.png
+
+# OS
+.DS_Store
+Thumbs.db
