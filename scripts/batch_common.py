@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,9 +9,11 @@ from typing import Callable
 
 import run_chatgpt_temporary_test as core
 from opml_utils import repair_and_validate_opml
+from selenium_browser import copy_login_session, has_auth_cookies, real_chrome_available, run_login_for_profile
 
 ROOT = core.ROOT
 LOGS_DIR = ROOT / "logs"
+MAIN_CHROME_PROFILE = ROOT / "chrome_profile"
 SKIP_NAME_PREFIXES = ("00_INDEX", "00_SPLIT_INDEX", "INDEX")
 SKIP_NAME_STEMS = {"README", "INDEX"}
 
@@ -49,13 +52,29 @@ def wait_for_download(before: set[Path], timeout: int = 90) -> Path | None:
     return None
 
 
+def is_browser_crash_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    markers = (
+        "epipe",
+        "target closed",
+        "browser has been closed",
+        "browser window was closed",
+        "connection closed",
+        "session closed",
+        "protocol error",
+    )
+    return any(marker in message for marker in markers)
+
+
 def driver_is_alive(driver) -> bool:
     if driver is None:
         return False
     try:
         _ = driver.title
         return True
-    except Exception:
+    except Exception as exc:
+        if is_browser_crash_error(exc):
+            return False
         return False
 
 
@@ -101,12 +120,23 @@ def recover_from_chat_error(
 
 def recreate_driver(model: str | None, *, skip_warmup: bool = False):
     batch_log("Detected dead or disconnected browser session. Recreating driver...")
+    quit_driver(None)
+    if os.environ.get("CHATGPT_SYNC_PROFILE_FROM", "").strip():
+        sync_profile_from_main()
+    clear_profile_locks(core.CHROME_PROFILE_DIR)
     prune_automation_cookies()
     driver = core.build_driver(browser="chrome")
     driver.set_window_size(1400, 950)
     driver.get(core.CHATGPT_URL)
     batch_log("Checking login state...")
-    core.wait_until_logged_in(driver)
+    if _playwright_needs_login(driver, probe_seconds=8):
+        quit_driver(driver)
+        _recover_playwright_login()
+        clear_profile_locks(core.CHROME_PROFILE_DIR)
+        driver = core.build_driver(browser="chrome")
+        driver.set_window_size(1400, 950)
+        driver.get(core.CHATGPT_URL)
+    core.wait_until_logged_in(driver, timeout=120)
     batch_log("Logged-in chat box is visible.")
     if not skip_warmup:
         warm_up(driver, model)
@@ -153,7 +183,39 @@ def prune_driver_cookies(driver) -> int:
     return removed
 
 
+def clear_profile_locks(profile_dir: Path) -> None:
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        path = profile_dir / name
+        if path.exists():
+            path.unlink(missing_ok=True)
+        default_path = profile_dir / "Default" / name
+        if default_path.exists():
+            default_path.unlink(missing_ok=True)
+
+
+def sync_profile_from_main(target_profile: Path | None = None) -> None:
+    """Copy auth session from main chrome_profile into a worker profile."""
+    source = Path(os.environ.get("CHATGPT_SYNC_PROFILE_FROM", MAIN_CHROME_PROFILE))
+    target = target_profile or core.CHROME_PROFILE_DIR
+    if source.resolve() == target.resolve():
+        return
+    if not has_auth_cookies(source):
+        raise RuntimeError(f"No login session in main profile: {source}")
+    clear_profile_locks(target)
+    copy_login_session(source, target)
+    batch_log(f"Synced login session: {source.name} -> {target.name}")
+
+
 def prune_automation_cookies() -> None:
+    if os.environ.get("CHATGPT_SKIP_COOKIE_PRUNE") == "1":
+        batch_log("Skipping cookie prune (worker profile sync).")
+        return
+    profile_default = core.CHROME_PROFILE_DIR / "Default"
+    cookies_db = profile_default / "Cookies"
+    if not cookies_db.exists():
+        batch_log("Skipping cookie prune — no Cookies database yet.")
+        return
+
     script = ROOT / "scripts" / "prune_chatgpt_cookies.py"
     if not script.exists():
         return
@@ -162,7 +224,13 @@ def prune_automation_cookies() -> None:
 
     batch_log("Pruning automation cookies (keeping login session)...")
     result = subprocess.run(
-        [sys.executable, str(script), "--profile-dir", str(core.CHROME_PROFILE_DIR / "Default")],
+        [
+            sys.executable,
+            str(script),
+            "--profile-dir",
+            str(profile_default),
+            "--no-cache-clear",
+        ],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -173,15 +241,77 @@ def prune_automation_cookies() -> None:
         batch_log(f"Cookie prune warning: {result.stderr.strip() or result.returncode}")
 
 
+def ensure_login_session() -> None:
+    """macwili-style: use real Chromium for first login, then reuse saved profile."""
+    if os.environ.get("CHATGPT_SKIP_REAL_CHROME_LOGIN") == "1":
+        return
+
+    profile_dir = core.CHROME_PROFILE_DIR
+    if has_auth_cookies(profile_dir) and os.environ.get("CHATGPT_FORCE_REAL_CHROME_LOGIN") != "1":
+        batch_log(f"Login session found in {profile_dir.name}/ (will verify in browser)")
+        return
+
+    if not real_chrome_available():
+        raise RuntimeError(
+            "No ChatGPT login session and no real Chromium installed. "
+            "Run: sudo dnf install chromium"
+        )
+
+    batch_log("First run: Playwright stealth cannot pass Google login.")
+    run_login_for_profile(target_profile=profile_dir)
+
+
+def _playwright_needs_login(driver, *, probe_seconds: int = 12) -> bool:
+    deadline = time.time() + probe_seconds
+    while time.time() < deadline:
+        try:
+            core.wait_until_logged_in(driver, timeout=4)
+            return False
+        except Exception as exc:
+            message = str(exc).lower()
+            if "google blocked sign-in" in message:
+                return True
+            if "timed out" in message:
+                time.sleep(1)
+                continue
+            raise
+    return True
+
+
+def _recover_playwright_login() -> None:
+    """Never open Selenium during parallel workers — sync cookies from main profile instead."""
+    if os.environ.get("CHATGPT_SKIP_REAL_CHROME_LOGIN") == "1":
+        sync_profile_from_main()
+        return
+    batch_log("Playwright Chromium is not logged in (Google blocks sign-in here).")
+    run_login_for_profile(target_profile=core.CHROME_PROFILE_DIR)
+
+
 def bootstrap_session(model: str | None, *, skip_warmup: bool = False):
+    sync_from = os.environ.get("CHATGPT_SYNC_PROFILE_FROM", "").strip()
+    if sync_from:
+        sync_profile_from_main()
+    else:
+        ensure_login_session()
+    clear_profile_locks(core.CHROME_PROFILE_DIR)
     prune_automation_cookies()
     driver = core.build_driver(browser="chrome")
     driver.set_window_size(1400, 950)
     driver.get(core.CHATGPT_URL)
     batch_log("ChatGPT opened.")
     batch_log("Checking login state...")
-    core.wait_until_logged_in(driver)
-    batch_log("Logged-in chat box is visible.")
+    if _playwright_needs_login(driver):
+        quit_driver(driver)
+        _recover_playwright_login()
+        clear_profile_locks(core.CHROME_PROFILE_DIR)
+        prune_automation_cookies()
+        driver = core.build_driver(browser="chrome")
+        driver.set_window_size(1400, 950)
+        driver.get(core.CHATGPT_URL)
+        batch_log("Retrying automation browser with saved session...")
+        core.wait_until_logged_in(driver, timeout=120)
+    else:
+        batch_log("Logged-in chat box is visible.")
     if skip_warmup:
         reset_chat(driver, model)
         batch_log("Skipped warm-up hello message.")
@@ -266,7 +396,11 @@ def run_with_retries(
                 driver = recreate_driver(model, skip_warmup=skip_warmup)
         except Exception as exc:
             batch_log(f"ERROR on attempt {attempt}/{max_attempts} for {label}: {exc}")
-            if is_temporary_chat_error(exc):
+            if is_browser_crash_error(exc) or not driver_is_alive(driver):
+                batch_log("Browser crashed or disconnected — recreating session...")
+                quit_driver(driver)
+                driver = recreate_driver(model, skip_warmup=skip_warmup)
+            elif is_temporary_chat_error(exc):
                 driver = recover_from_chat_error(driver, model, skip_warmup=skip_warmup)
             elif driver_is_alive(driver):
                 reset_chat(driver, model)

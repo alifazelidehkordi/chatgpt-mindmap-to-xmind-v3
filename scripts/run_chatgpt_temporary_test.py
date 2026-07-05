@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -294,23 +295,40 @@ class PlaywrightDriver:
         _run(self.page.screenshot(path=path, full_page=True))
 
 
+def _system_chromium_path() -> str | None:
+    override = os.environ.get("CHATGPT_CHROME_BINARY", "").strip()
+    if override:
+        return override
+    for name in ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 async def _launch_playwright(headless: bool, profile_dir: Path | None = None):
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     profile = profile_dir or Path(os.environ.get("CHATGPT_CHROME_PROFILE_DIR", CHROME_PROFILE_DIR))
     profile.mkdir(parents=True, exist_ok=True)
 
     playwright = await async_playwright().start()
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(profile),
-        headless=headless,
-        args=[
+    launch_kwargs: dict = {
+        "user_data_dir": str(profile),
+        "headless": headless,
+        "args": [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-dev-shm-usage",
         ],
-        downloads_path=str(DOWNLOAD_DIR),
-        viewport={"width": 1400, "height": 950},
-    )
+        "downloads_path": str(DOWNLOAD_DIR),
+        "viewport": {"width": 1400, "height": 950},
+    }
+    chromium_bin = _system_chromium_path()
+    if chromium_bin and os.environ.get("CHATGPT_USE_BUNDLED_CHROMIUM") != "1":
+        launch_kwargs["executable_path"] = chromium_bin
+        log(f"Using system Chromium: {chromium_bin}")
+    context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
     page = context.pages[0] if context.pages else await context.new_page()
     if STEALTH_AVAILABLE:
         await Stealth().apply_stealth_async(page)
@@ -364,13 +382,33 @@ async def _login_buttons_visible(page: Page) -> bool:
         return False
 
 
+async def _cloudflare_challenge_visible(page: Page) -> bool:
+    try:
+        text = (await page.locator("body").inner_text(timeout=2000)).lower()
+        return (
+            "verify you are human" in text
+            or "checking your browser" in text
+            or "just a moment" in text
+        )
+    except Exception:
+        return False
+
+
 async def _wait_until_logged_in(page: Page, timeout: int = 600, headless: bool = False) -> None:
     deadline = time.time() + timeout
     login_prompted = False
+    cloudflare_prompted = False
     reload_count = 0
 
     while time.time() < deadline:
         await _dismiss_cookie_banner(page)
+        if await _cloudflare_challenge_visible(page):
+            if not cloudflare_prompted:
+                log(">>> Cloudflare check: click 'Verify you are human' in the browser window.")
+                log(">>> Do NOT close the window — script will continue automatically.")
+                cloudflare_prompted = True
+            await asyncio.sleep(3)
+            continue
         if await _login_buttons_visible(page):
             if headless:
                 raise RuntimeError(
@@ -378,8 +416,18 @@ async def _wait_until_logged_in(page: Page, timeout: int = 600, headless: bool =
                     "Use a pre-logged chrome_profile/ or run without --headless first."
                 )
             if not login_prompted:
-                log(">>> LOGIN REQUIRED: In the Chromium window, click Log in and sign in to ChatGPT.")
-                log(">>> Keep that browser window open — do not close it.")
+                body = ""
+                try:
+                    body = (await page.locator("body").inner_text(timeout=2000)).lower()
+                except Exception:
+                    pass
+                if "browser or app may not be secure" in body or "couldn't sign you in" in body:
+                    raise RuntimeError(
+                        "Google blocked sign-in in Playwright Chromium. "
+                        "Close this window — the script will open real Chromium for login."
+                    )
+                log(">>> Waiting for saved login session (do NOT sign in with Google here).")
+                log(">>> If this persists, the script will switch to real Chromium automatically.")
                 login_prompted = True
             await asyncio.sleep(3)
             continue
@@ -390,21 +438,26 @@ async def _wait_until_logged_in(page: Page, timeout: int = 600, headless: bool =
                 log("Login successful — chat editor is ready.")
             return
         except TimeoutError:
+            if await _cloudflare_challenge_visible(page):
+                await asyncio.sleep(3)
+                continue
             reload_count += 1
             if reload_count == 1:
-                log("ChatGPT editor not visible yet.")
-                log(">>> If you see Log in / Sign up, sign in now in the browser window.")
-            elif reload_count == 3:
-                log(">>> Still waiting: finish login, accept cookies, then wait for the chat box.")
-            log(f"Reloading ChatGPT ({reload_count})...")
-            try:
-                await page.reload()
-            except Exception as exc:
-                if "closed" in str(exc).lower():
-                    raise RuntimeError(
-                        "Browser window was closed during login. Re-run the batch script and keep the window open."
-                    ) from exc
-                raise
+                log("ChatGPT editor not visible yet — waiting (no auto-refresh on Cloudflare).")
+            elif reload_count == 5:
+                log(">>> Still waiting: complete Cloudflare check or login, then wait for chat box.")
+            if reload_count <= 3:
+                log(f"Reloading ChatGPT ({reload_count}/3)...")
+                try:
+                    await page.reload()
+                except Exception as exc:
+                    if "closed" in str(exc).lower():
+                        raise RuntimeError(
+                            "Browser window was closed during login. Re-run the batch script and keep the window open."
+                        ) from exc
+                    raise
+            else:
+                await asyncio.sleep(3)
             continue
 
     raise TimeoutError("Timed out waiting for ChatGPT login.")

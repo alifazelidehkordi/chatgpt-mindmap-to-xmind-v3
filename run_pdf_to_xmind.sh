@@ -5,6 +5,8 @@ cd "$(dirname "$0")"
 
 echo "=== PDF/DOCX -> OPML -> XMind Pipeline v3 (Linux) ==="
 echo "Project dir: $(pwd)"
+echo ""
+echo "First run: script auto-opens real Chromium for Google login, then continues."
 
 VENV_DIR=".venv-linux"
 PYTHON="${VENV_DIR}/bin/python"

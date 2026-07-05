@@ -1,2 +1,5 @@
 patchright
 playwright-stealth
+selenium
+pyautogui
+pyperclip
